@@ -9,6 +9,43 @@ from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
 
+def _unwrap_to_layers_model(module: nn.Module) -> nn.Module:
+    """Unwrap common wrappers (e.g., PEFT) to a module exposing `.layers` and `.norm`."""
+    cur = module
+    for _ in range(8):
+        if hasattr(cur, "layers") and hasattr(cur, "norm"):
+            return cur
+        if hasattr(cur, "get_base_model"):
+            try:
+                cur = cur.get_base_model()  # type: ignore[no-any-return]
+                continue
+            except Exception:  # noqa: BLE001
+                pass
+        if hasattr(cur, "base_model"):
+            cur = cur.base_model  # type: ignore[attr-defined]
+            continue
+        if hasattr(cur, "model"):
+            maybe = cur.model  # type: ignore[attr-defined]
+            if hasattr(maybe, "layers") and hasattr(maybe, "norm"):
+                cur = maybe
+                continue
+        break
+    return cur
+
+
+def _weight_dtype(module: nn.Module) -> torch.dtype | None:
+    """Best-effort dtype lookup for (possibly wrapped) linear layers."""
+    w = getattr(module, "weight", None)
+    if isinstance(w, torch.Tensor):
+        return w.dtype
+    for attr in ("base_layer", "original_layer"):
+        base = getattr(module, attr, None)
+        w = getattr(base, "weight", None)
+        if isinstance(w, torch.Tensor):
+            return w.dtype
+    return None
+
+
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -124,40 +161,19 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = None
             prefix_past_key_values = None
         else:
-            models = [self.paligemma.language_model, self.gemma_expert.model]
+            models = [
+                _unwrap_to_layers_model(self.paligemma.language_model),
+                _unwrap_to_layers_model(self.gemma_expert.model),
+            ]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
             # Check if gradient checkpointing is enabled for any of the models
-            use_gradient_checkpointing = (
-                hasattr(self.gemma_expert.model, "gradient_checkpointing")
-                and self.gemma_expert.model.gradient_checkpointing
-                and self.training
-            ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
-
-            # Force enable gradient checkpointing if we're in training mode and the model supports it
-            if self.training and hasattr(self.gemma_expert.model, "gradient_checkpointing"):
-                if not self.gemma_expert.model.gradient_checkpointing:
-                    print("Forcing gradient checkpointing to be enabled for Gemma expert model")
-                    self.gemma_expert.model.gradient_checkpointing = True
-                use_gradient_checkpointing = True
-
-            # Debug gradient checkpointing status
-            if hasattr(self, "_debug_gc_printed") and not self._debug_gc_printed:
-                print(f"Gemma expert model gradient checkpointing: {use_gradient_checkpointing}")
-                print(f"Model training mode: {self.training}")
-                print(
-                    f"Gemma expert model has gradient_checkpointing attr: {hasattr(self.gemma_expert.model, 'gradient_checkpointing')}"
-                )
-                if hasattr(self.gemma_expert.model, "gradient_checkpointing"):
-                    print(
-                        f"Gemma expert model gradient_checkpointing value: {self.gemma_expert.model.gradient_checkpointing}"
-                    )
-                self._debug_gc_printed = True
+            use_gradient_checkpointing = self.training and any(
+                getattr(m, "gradient_checkpointing", False) for m in models if m is not None
+            )
 
             # Define the complete layer computation function for gradient checkpointing
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
-                models = [self.paligemma.language_model, self.gemma_expert.model]
-
                 query_states = []
                 key_states = []
                 value_states = []
@@ -189,17 +205,17 @@ class PaliGemmaWithExpertModel(nn.Module):
                     device=query_states.device,
                     dtype=query_states.dtype,
                 )
-                cos, sin = self.paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
+                cos, sin = models[0].rotary_emb(dummy_tensor, position_ids)
                 query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, unsqueeze_dim=1
                 )
 
                 batch_size = query_states.shape[0]
-                scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
+                scaling = models[0].layers[layer_idx].self_attn.scaling
 
                 # Attention computation
                 att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
+                    models[0].layers[layer_idx].self_attn,
                     query_states,
                     key_states,
                     value_states,
@@ -207,7 +223,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                     scaling,
                 )
                 # Get head_dim from the current layer, not from the model
-                head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
+                head_dim = models[0].layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
 
                 # Process layer outputs
@@ -217,8 +233,9 @@ class PaliGemmaWithExpertModel(nn.Module):
                     layer = models[i].layers[layer_idx]
                     end_pos = start_pos + hidden_states.shape[1]
 
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+                    o_proj_dtype = _weight_dtype(layer.self_attn.o_proj)
+                    if o_proj_dtype is not None and att_output.dtype != o_proj_dtype:
+                        att_output = att_output.to(o_proj_dtype)
                     out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
 
                     # first residual
@@ -226,7 +243,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                     after_first_residual = out_emb.clone()
                     out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
                     # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-                    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                    up_proj_dtype = _weight_dtype(layer.mlp.up_proj)
+                    if up_proj_dtype == torch.bfloat16:
                         out_emb = out_emb.to(dtype=torch.bfloat16)
 
                     out_emb = layer.mlp(out_emb)

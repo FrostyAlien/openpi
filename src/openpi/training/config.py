@@ -35,6 +35,39 @@ Filter: TypeAlias = nnx.filterlib.Filter
 
 
 @dataclasses.dataclass(frozen=True)
+class PytorchPeftLoRAConfig:
+    """PEFT LoRA configuration for the PyTorch trainer.
+
+    Notes:
+      - This only affects `scripts/train_pytorch.py`.
+      - This is intentionally minimal and uses PEFT defaults where possible.
+    """
+
+    # Which submodules to LoRA-tune.
+    target: Literal["text", "vision", "text_vision"] = "text"
+
+    # If true, and the model config uses `*_lora` variants, derive (r, alpha) from the model variants
+    # (matching the JAX Gemma LoRA defaults).
+    use_model_variant_defaults: bool = True
+
+    # LoRA rank / scaling.
+    r: int = 16
+    alpha: int = 16
+    dropout: float = 0.0
+
+    # Bias handling (PEFT).
+    bias: Literal["none", "all", "lora_only"] = "none"
+
+    # If true, use rank-stabilized LoRA scaling (RS-LoRA).
+    rslora: bool = False
+
+    # If true, the PyTorch trainer will write a merged, adapter-free checkpoint suitable for serving.
+    save_merged_checkpoint: bool = True
+    # Directory name (under `checkpoint_dir/`) used for the merged checkpoint.
+    merged_checkpoint_name: str = "merged"
+
+
+@dataclasses.dataclass(frozen=True)
 class AssetsConfig:
     """Determines the location of assets (e.g., norm stats) that will be used to set up the data pipeline.
 
@@ -485,6 +518,9 @@ class TrainConfig:
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
+    # Optional PEFT LoRA config for PyTorch training (no effect for JAX training).
+    pytorch_peft_lora: PytorchPeftLoRAConfig | None = None
+
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
@@ -748,7 +784,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=256,
+        batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -758,7 +794,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        pytorch_weight_path="checkpoints/pytorch/converted/pi05_base",
         num_train_steps=30_000,
     ),
     #
@@ -937,12 +973,13 @@ _CONFIGS = [
         name="debug",
         data=FakeDataConfig(),
         batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
         save_interval=100,
         overwrite=True,
         exp_name="debug",
         num_train_steps=10,
         wandb_enabled=False,
+        pytorch_weight_path="checkpoints/pytorch/converted/pi05_base"
     ),
     TrainConfig(
         name="debug_restore",
@@ -966,6 +1003,40 @@ _CONFIGS = [
         wandb_enabled=False,
     ),
     TrainConfig(
+        name="debug_pytorch_peft_lora_text",
+        data=FakeDataConfig(),
+        batch_size=1,
+        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        pytorch_training_precision="float32",
+        pytorch_peft_lora=PytorchPeftLoRAConfig(target="text", use_model_variant_defaults=False, r=4, alpha=4),
+        overwrite=True,
+        exp_name="debug_pytorch_peft_lora_text",
+        num_train_steps=2,
+        log_interval=1,
+        save_interval=1,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_pytorch_peft_lora_text_vision",
+        data=FakeDataConfig(),
+        batch_size=1,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        pytorch_peft_lora=PytorchPeftLoRAConfig(target="text_vision"),
+        overwrite=True,
+        exp_name="debug_pytorch_peft_lora_text_vision",
+        num_train_steps=2,
+        log_interval=1,
+        save_interval=1,
+        wandb_enabled=False,
+        pytorch_weight_path="checkpoints/pytorch/converted/pi05_base",
+    ),
+    TrainConfig(
     name="pi05_libero_low_mem_finetune",
     # pi05 model with LoRA finetuning for lower memory usage.
     model=pi0_config.Pi0Config(
@@ -975,12 +1046,16 @@ _CONFIGS = [
         paligemma_variant="gemma_2b_lora",
         action_expert_variant="gemma_300m_lora",
     ),
+    batch_size=32,
     data=LeRobotLiberoDataConfig(
         repo_id="physical-intelligence/libero",
         base_config=DataConfig(prompt_from_task=True),
         extra_delta_transform=False,
     ),
     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+    # NOTE: The PyTorch trainer (`scripts/train_pytorch.py`) does not use `weight_loader`;
+    # it loads base weights from `pytorch_weight_path` (a converted safetensors checkpoint).
+    pytorch_weight_path="checkpoints/pytorch/converted/pi05_base",
     num_train_steps=30_000,
     # Freeze all parameters except LoRA weights.
     freeze_filter=pi0_config.Pi0Config(
@@ -993,12 +1068,12 @@ _CONFIGS = [
     # Turn off EMA for LoRA finetuning.
     ema_decay=None,
     optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
-        ),
+        # lr_schedule=_optimizer.CosineDecaySchedule(
+        #     warmup_steps=10_000,
+        #     peak_lr=5e-5,
+        #     decay_steps=1_000_000,
+        #     decay_lr=5e-5,
+        # ),
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

@@ -47,6 +47,180 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data
 
 
+def _count_parameters(module: torch.nn.Module) -> tuple[int, int]:
+    total = 0
+    trainable = 0
+    for p in module.parameters():
+        n = p.numel()
+        total += n
+        if p.requires_grad:
+            trainable += n
+    return total, trainable
+
+
+def _apply_peft_lora(model: torch.nn.Module, config: _config.TrainConfig) -> _config.PytorchPeftLoRAConfig | None:
+    """Optionally applies PEFT LoRA to the underlying HF submodules.
+
+    This mutates the model in-place.
+    """
+    base = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    model_cfg = getattr(base, "config", None) or config.model
+
+    lora_cfg = config.pytorch_peft_lora
+    pal_variant = str(getattr(model_cfg, "paligemma_variant", ""))
+    exp_variant = str(getattr(model_cfg, "action_expert_variant", ""))
+    if lora_cfg is None:
+        # Mirror the JAX semantics: selecting a `*_lora` variant implies LoRA is active.
+        if ("lora" in str(pal_variant)) or ("lora" in str(exp_variant)):
+            lora_cfg = _config.PytorchPeftLoRAConfig(target="text", use_model_variant_defaults=True)
+        else:
+            return None
+
+    try:
+        from peft import LoraConfig
+        from peft.tuners.lora import LoraModel
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "PEFT is required for `pytorch_peft_lora` but could not be imported. "
+            "Install the project dependencies (pyproject.toml includes `peft`)."
+        ) from e
+
+    # Targets that exist in the Gemma text model.
+    text_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    # Targets that exist in the SigLIP vision model used by PaliGemma.
+    vision_target_modules = ["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]
+
+    paligemma_with_expert = base.paligemma_with_expert
+
+    def _mk_lora_config(*, target_modules: list[str], r: int, alpha: float) -> LoraConfig:
+        return LoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=lora_cfg.dropout,
+            bias=lora_cfg.bias,
+            use_rslora=lora_cfg.rslora,
+            target_modules=target_modules,
+        )
+
+    applied_any = False
+
+    if lora_cfg.target in {"text", "text_vision"}:
+        # Match JAX defaults when using *_lora variants: gemma.get_config(variant).lora_configs.
+        import openpi.models.gemma as _gemma
+
+        def _variant_r_alpha(variant: str | None) -> tuple[int, float] | None:
+            if not variant or "lora" not in variant:
+                return None
+            cfg = _gemma.get_config(variant)
+            if not cfg.lora_configs:
+                return None
+            # attn and ffn configs share rank/alpha in our variants; use any.
+            c = cfg.lora_configs.get("attn") or next(iter(cfg.lora_configs.values()))
+            return c.rank, float(c.alpha)
+
+        wrap_pal = (not lora_cfg.use_model_variant_defaults) or ("lora" in pal_variant)
+        wrap_exp = (not lora_cfg.use_model_variant_defaults) or ("lora" in exp_variant)
+
+        pal_r_alpha = _variant_r_alpha(pal_variant) if lora_cfg.use_model_variant_defaults else None
+        exp_r_alpha = _variant_r_alpha(exp_variant) if lora_cfg.use_model_variant_defaults else None
+
+        pal_r, pal_alpha = pal_r_alpha if pal_r_alpha is not None else (lora_cfg.r, float(lora_cfg.alpha))
+        exp_r, exp_alpha = exp_r_alpha if exp_r_alpha is not None else (lora_cfg.r, float(lora_cfg.alpha))
+
+        def _wrap_text(module: torch.nn.Module, peft_cfg: LoraConfig) -> torch.nn.Module:
+            # Use LoraModel directly to preserve forward signatures and avoid task-type wrappers.
+            return LoraModel(module, peft_cfg, "default")
+
+        if wrap_pal:
+            pal_text_peft = _mk_lora_config(target_modules=text_target_modules, r=pal_r, alpha=pal_alpha)
+            # NOTE: this is a GemmaModel instance (not *ForCausalLM*), because PaliGemma uses AutoModel.
+            paligemma_with_expert.paligemma.model.language_model = _wrap_text(
+                paligemma_with_expert.paligemma.model.language_model, pal_text_peft
+            )
+            applied_any = True
+        if wrap_exp:
+            exp_text_peft = _mk_lora_config(target_modules=text_target_modules, r=exp_r, alpha=exp_alpha)
+            paligemma_with_expert.gemma_expert.model = _wrap_text(paligemma_with_expert.gemma_expert.model, exp_text_peft)
+            applied_any = True
+
+    if lora_cfg.target in {"vision", "text_vision"}:
+        vision_peft = _mk_lora_config(target_modules=vision_target_modules, r=lora_cfg.r, alpha=float(lora_cfg.alpha))
+        paligemma_with_expert.paligemma.model.vision_tower = LoraModel(
+            paligemma_with_expert.paligemma.model.vision_tower, vision_peft, "default"
+        )
+        applied_any = True
+
+    if not applied_any:
+        return None
+
+    total, trainable = _count_parameters(base)
+    details = [f"target={lora_cfg.target}"]
+    if lora_cfg.target in {"text", "text_vision"}:
+        details.append(f"wrapped_text_paligemma={wrap_pal}")
+        details.append(f"wrapped_text_expert={wrap_exp}")
+        if wrap_pal:
+            details.append(f"text_paligemma_r={pal_r}")
+            details.append(f"text_paligemma_alpha={pal_alpha:g}")
+        if wrap_exp:
+            details.append(f"text_expert_r={exp_r}")
+            details.append(f"text_expert_alpha={exp_alpha:g}")
+        details.append(f"use_model_variant_defaults={lora_cfg.use_model_variant_defaults}")
+    if lora_cfg.target in {"vision", "text_vision"}:
+        details.append(f"vision_r={lora_cfg.r}")
+        details.append(f"vision_alpha={float(lora_cfg.alpha):g}")
+    logging.info(
+        "Applied PEFT LoRA (%s). Trainable params: %.2fM / %.2fM",
+        ", ".join(details),
+        trainable / 1e6,
+        total / 1e6,
+    )
+    return lora_cfg
+
+
+def _save_merged_peft_checkpoint(
+    model: torch.nn.Module,
+    lora_cfg: _config.PytorchPeftLoRAConfig | None,
+    config: _config.TrainConfig,
+    *,
+    global_step: int,
+    is_main: bool,
+    data_config,
+) -> None:
+    if not is_main:
+        return
+    if lora_cfg is None or not lora_cfg.save_merged_checkpoint:
+        return
+
+    base = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    pwe = base.paligemma_with_expert
+
+    def _maybe_merge(module: torch.nn.Module) -> torch.nn.Module:
+        merge_fn = getattr(module, "merge_and_unload", None)
+        return merge_fn() if callable(merge_fn) else module
+
+    # Merge adapters into base weights and drop PEFT wrappers.
+    pwe.paligemma.model.language_model = _maybe_merge(pwe.paligemma.model.language_model)
+    pwe.gemma_expert.model = _maybe_merge(pwe.gemma_expert.model)
+    pwe.paligemma.model.vision_tower = _maybe_merge(pwe.paligemma.model.vision_tower)
+
+    merged_dir = config.checkpoint_dir / lora_cfg.merged_checkpoint_name
+    if merged_dir.exists():
+        shutil.rmtree(merged_dir)
+    merged_dir.mkdir(parents=True, exist_ok=True)
+
+    safetensors.torch.save_model(base, merged_dir / "model.safetensors")
+    torch.save(
+        {"global_step": global_step, "config": dataclasses.asdict(config), "timestamp": time.time()},
+        merged_dir / "metadata.pt",
+    )
+
+    norm_stats = data_config.norm_stats
+    if norm_stats is not None and data_config.asset_id is not None:
+        _normalize.save(merged_dir / "assets" / data_config.asset_id, norm_stats)
+
+    logging.info("Saved merged (adapter-free) checkpoint -> %s", merged_dir)
+
+
 def init_logging():
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
 
@@ -126,24 +300,6 @@ def build_datasets(config: _config.TrainConfig):
     # Use the unified data loader with PyTorch framework
     data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
     return data_loader, data_loader.data_config()
-
-
-def get_model_state_dict(model):
-    """Get state dict from model, handling DDP wrapper."""
-    return (
-        model.module.state_dict()
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel)
-        else model.state_dict()
-    )
-
-
-def get_model_parameters(model):
-    """Get parameters from model, handling DDP wrapper."""
-    return (
-        model.module.parameters()
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel)
-        else model.parameters()
-    )
 
 
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
@@ -420,6 +576,12 @@ def train_loop(config: _config.TrainConfig):
     if is_main and torch.cuda.is_available():
         log_memory_usage(device, 0, "after_model_creation")
 
+    if (not resuming) and (config.pytorch_weight_path is None):
+        logging.warning(
+            "No `pytorch_weight_path` set and not resuming from an experiment checkpoint: "
+            "model weights remain randomly initialized (training from scratch, not finetuning)."
+        )
+
     # Enable memory optimizations for large-scale training
     if world_size >= 8:
         torch.backends.cudnn.benchmark = True
@@ -428,15 +590,6 @@ def train_loop(config: _config.TrainConfig):
         # Set memory allocation configuration
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
-
-    if use_ddp:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
-        )
 
     # Load weights from weight_loader if specified (for fine-tuning)
     if config.pytorch_weight_path is not None:
@@ -448,6 +601,19 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
+    # Optionally apply LoRA via PEFT after loading any base weights.
+    effective_lora_cfg = _apply_peft_lora(model, config)
+
+    # Wrap in DDP AFTER any adapter injection so DDP sees the correct parameter set.
+    if use_ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            find_unused_parameters=True,  # Disable for memory efficiency
+            gradient_as_bucket_view=True,  # Enable for memory efficiency
+            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+        )
+
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
@@ -455,8 +621,9 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    params = [p for p in model.parameters() if p.requires_grad] if effective_lora_cfg is not None else None
     optim = torch.optim.AdamW(
-        model.parameters(),
+        params if params is not None else model.parameters(),
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -610,6 +777,11 @@ def train_loop(config: _config.TrainConfig):
                 pbar.set_postfix(
                     {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
                 )
+
+    # Optionally write a merged, adapter-free checkpoint for serving.
+    _save_merged_peft_checkpoint(
+        model, effective_lora_cfg, config, global_step=global_step, is_main=is_main, data_config=data_config
+    )
 
     # Close progress bar
     if pbar is not None:

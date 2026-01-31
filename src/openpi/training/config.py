@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.so101_policy as so101_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -222,20 +223,32 @@ class DataConfigFactory(abc.ABC):
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id, repo_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
-    def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
-        if asset_id is None:
+    def _load_norm_stats(
+        self, assets_dir: epath.Path, asset_id: str | None, repo_id: str | None
+    ) -> dict[str, _transforms.NormStats] | None:
+        if asset_id is None and repo_id is None:
             return None
-        try:
-            data_assets_dir = str(assets_dir / asset_id)
-            norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
-            logging.info(f"Loaded norm stats from {data_assets_dir}")
-            return norm_stats
-        except FileNotFoundError:
-            logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
+
+        # Try asset_id first, then fall back to repo_id for backwards compatibility with older tooling.
+        candidates = []
+        if asset_id is not None:
+            candidates.append(asset_id)
+        if repo_id is not None and repo_id not in candidates:
+            candidates.append(repo_id)
+
+        for candidate in candidates:
+            try:
+                data_assets_dir = str(assets_dir / candidate)
+                norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
+                logging.info(f"Loaded norm stats from {data_assets_dir}")
+                return norm_stats
+            except FileNotFoundError:
+                logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
+
         return None
 
 
@@ -305,6 +318,55 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSo101FollowerDataConfig(DataConfigFactory):
+    """Data config for LeRobot v3.0 datasets from simple follower robots (e.g. `robot_type=so101_follower`)."""
+
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_head": "observation.images.head",
+                            "cam_right_wrist": "observation.images.right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    # Underlying action dimension of the robot (used for inference post-processing).
+    robot_action_dim: int = 6
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[so101_policy.So101FollowerInputs()],
+            outputs=[so101_policy.So101FollowerOutputs(action_dim=self.robot_action_dim)],
+        )
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
@@ -869,31 +931,36 @@ _CONFIGS = [
     ),
     ## config for our dataset
     TrainConfig(
-        name="pi05_aloha_pickup_ball_lora",
+        name="pi05_so101_pickup_ball_lora",
         # LoRA fine-tuning (lower memory): use `*_lora` variants and freeze the base weights.
         model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotAlohaDataConfig(
+        data=LeRobotSo101FollowerDataConfig(
             repo_id="DerekLX/xlerobot_Derek_dataset_pickupball",
-            assets=AssetsConfig(
-                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
-                asset_id="trossen",
-            ),
-            default_prompt="Pick up the object and place it into the box.",
-            repack_transforms=_transforms.Group(
-                inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.cam_high",
-                                #"cam_left_wrist": "observation.images.cam_left_wrist",
-                                "cam_right_wrist": "observation.images.cam_right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                        }
-                    )
-                ]
-            ),
+            # This dataset repo is not tagged with a LeRobot codebase version; use the default branch.
+            base_config=DataConfig(lerobot_revision="main"),
+            # Norm stats should be computed for this robot/dataset via `scripts/compute_norm_stats.py`.
+            assets=AssetsConfig(asset_id="so101_follower"),
+            default_prompt="Pick the ball and place in the box.",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="checkpoints/pytorch/converted/pi05_base",
+        pytorch_peft_lora=PytorchPeftLoRAConfig(target="text", use_model_variant_defaults=True),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=30_000,
+        batch_size=8,
+    ),
+    # Backwards-compat alias (kept for older commands/tutorials).
+    TrainConfig(
+        name="pi05_aloha_pickup_ball_lora",
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotSo101FollowerDataConfig(
+            repo_id="DerekLX/xlerobot_Derek_dataset_pickupball",
+            base_config=DataConfig(lerobot_revision="main"),
+            assets=AssetsConfig(asset_id="so101_follower"),
+            default_prompt="Pick the ball and place in the box.",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="checkpoints/pytorch/converted/pi05_base",

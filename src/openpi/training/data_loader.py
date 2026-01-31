@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
@@ -137,12 +138,108 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    def _maybe_write_stub_tasks(*, repo_id: str) -> bool:
+        """Ensure `meta/tasks.jsonl` exists when task-conditioned prompts are not used."""
+        if data_config.prompt_from_task:
+            return False
+        try:
+            from lerobot.common.constants import HF_LEROBOT_HOME
+            from lerobot.common.datasets.utils import INFO_PATH, TASKS_PATH
+        except Exception:  # noqa: BLE001
+            return False
+
+        root = HF_LEROBOT_HOME / repo_id
+        info_path = root / INFO_PATH
+        tasks_path = root / TASKS_PATH
+
+        if tasks_path.exists() or not info_path.exists():
+            return False
+
+        try:
+            info = json.loads(info_path.read_text())
+            total_tasks = int(info.get("total_tasks") or 1)
+            total_tasks = max(total_tasks, 1)
+        except Exception:  # noqa: BLE001
+            total_tasks = 1
+
+        tasks_path.parent.mkdir(parents=True, exist_ok=True)
+        tasks = [{"task_index": i, "task": ("" if total_tasks == 1 else f"task_{i}")} for i in range(total_tasks)]
+        tasks_path.write_text("".join(json.dumps(t) + "\n" for t in tasks))
+        logging.warning(
+            "LeRobot dataset %s is missing %s; wrote a stub tasks file because `prompt_from_task` is disabled.",
+            repo_id,
+            TASKS_PATH,
+        )
+        return True
+
+    # If a dataset was recorded/assembled without task metadata, LeRobot errors while loading metadata even
+    # if the training pipeline doesn't use task-conditioned prompts. Work around this by creating a stub
+    # tasks file (only when `prompt_from_task` is disabled).
+    _maybe_write_stub_tasks(repo_id=repo_id)
+
+    revision = data_config.lerobot_revision
+    dataset_meta = None
+    try:
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, revision=revision)
+    except Exception as e:  # noqa: BLE001
+        try:
+            from huggingface_hub.errors import RevisionNotFoundError
+        except Exception:  # noqa: BLE001
+            RevisionNotFoundError = None  # type: ignore[misc,assignment]
+
+        # Missing tasks metadata can be synthesized when task-conditioned prompts are not used.
+        if isinstance(e, FileNotFoundError) and "meta/tasks.jsonl" in str(getattr(e, "filename", "")):
+            if data_config.prompt_from_task:
+                raise
+            if _maybe_write_stub_tasks(repo_id=repo_id):
+                dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, revision=revision)
+            else:
+                raise
+        else:
+            if RevisionNotFoundError is None or not isinstance(e, RevisionNotFoundError):
+                raise
+
+            # LeRobot enforces that datasets are tagged with the codebase version (e.g. "v2.1").
+            # If the dataset repo is missing those tags, fall back to the default branch.
+            requested_revision = revision or "<codebase-version-tag>"
+            last_err: Exception | None = None
+            for fallback_revision in ("main", "master"):
+                logging.warning(
+                    "LeRobot dataset %s is missing the required codebase-version tag for revision %r; "
+                    "falling back to revision %r. To silence this warning, set `data.lerobot_revision=%r` "
+                    "in your training config, or tag the dataset repo with the LeRobot codebase version.",
+                    repo_id,
+                    requested_revision,
+                    fallback_revision,
+                    fallback_revision,
+                )
+                try:
+                    revision = fallback_revision
+                    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, revision=revision)
+                    break
+                except Exception as err:  # noqa: BLE001
+                    if (
+                        isinstance(err, FileNotFoundError)
+                        and "meta/tasks.jsonl" in str(getattr(err, "filename", ""))
+                        and not data_config.prompt_from_task
+                        and _maybe_write_stub_tasks(repo_id=repo_id)
+                    ):
+                        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, revision=revision)
+                        break
+                    last_err = err
+                    dataset_meta = None
+                    continue
+
+            if dataset_meta is None:
+                if last_err is not None:
+                    raise last_err
+                raise
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        revision=revision,
     )
 
     if data_config.prompt_from_task:

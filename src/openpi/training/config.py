@@ -98,6 +98,12 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Optional Hugging Face revision (branch, tag, or commit) for the LeRobot dataset.
+    #
+    # By default, LeRobot expects datasets to be tagged with the LeRobot codebase version (e.g. "v2.1").
+    # If your dataset repo does not have those tags, set this to "main" (or "master") to force using the
+    # default branch instead.
+    lerobot_revision: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -860,6 +866,44 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
         batch_size=64,
+    ),
+    ## config for our dataset
+    TrainConfig(
+        name="pi05_aloha_pickup_ball_lora",
+        # LoRA fine-tuning (lower memory): use `*_lora` variants and freeze the base weights.
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotAlohaDataConfig(
+            repo_id="DerekLX/xlerobot_Derek_dataset_pickupball",
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            default_prompt="Pick up the object and place it into the box.",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                #"cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="checkpoints/pytorch/converted/pi05_base",
+        pytorch_peft_lora=PytorchPeftLoRAConfig(target="text", use_model_variant_defaults=True),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=30_000,
+        batch_size=8,
     ),
     #
     # Fine-tuning DROID configs.
